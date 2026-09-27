@@ -1,0 +1,6 @@
+.volume-control{display:flex;align-items:center;gap:2px;height:42px;padding-right:11px;border-radius:21px;background:#ffffff0c}
+.volume-control .volume-off,.volume-control.muted .volume-on{display:none}
+.volume-control.muted .volume-off{display:block}
+.volume-control input{width:86px;height:4px;margin:0;accent-color:#c8a2c8;cursor:pointer}
+.volume-control input:focus-visible{outline:3px solid #c8a2c8;outline-offset:3px}
+@media(max-width:700px){.volume-control input{width:58px}}

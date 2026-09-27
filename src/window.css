@@ -1,0 +1,19 @@
+/* Windows title-bar buttons occupy the top-right 138px in an overlay window. */
+.topbar {
+  padding-right: 158px;
+}
+
+.icon-btn,
+.profile {
+  flex: 0 0 35px;
+}
+
+@media (max-width: 760px) {
+  .topbar {
+    padding-right: 148px;
+  }
+
+  .profile {
+    display: none;
+  }
+}

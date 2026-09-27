@@ -1,0 +1,22 @@
+.skip-chip {
+  position: absolute;
+  z-index: 3;
+  right: 18px;
+  bottom: 28px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #ffffff2e;
+  border-radius: 15px;
+  padding: 10px 14px;
+  background: #000c;
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  transition: bottom .2s ease, background .2s ease;
+}
+
+.controls-visible .skip-chip { bottom: 138px; }
+.skip-chip:hover { background: #211a24; }
+.skip-chip svg { width: 19px; height: 19px; fill: currentColor; }
+.skip-chip.hidden { display: none; }
