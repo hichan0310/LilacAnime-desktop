@@ -48,7 +48,9 @@ function createLocalAi(userData) {
   }
   const runtimeExe = () => {
     const walk = dir => { try { return fs.readdirSync(dir, { withFileTypes: true }).flatMap(item => item.isDirectory() ? walk(path.join(dir, item.name)) : [path.join(dir, item.name)]); } catch { return []; } };
-    return walk(runtimeDir).find(file => path.basename(file).toLowerCase() === 'llama-server.exe') || null;
+    const name = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server';
+    const candidates = [process.env.LILAC_LLAMA_SERVER, ...walk(runtimeDir), ...(process.env.PATH || '').split(path.delimiter).map(dir => path.join(dir, name))];
+    return candidates.find(file => file && path.basename(file).toLowerCase() === name && (() => { try { fs.accessSync(file, process.platform === 'win32' ? fs.constants.F_OK : fs.constants.X_OK); return true; } catch { return false; } })()) || null;
   };
 
   async function download(url, target, progress) {
@@ -66,15 +68,25 @@ function createLocalAi(userData) {
     } catch (error) { out.destroy(); try { fs.unlinkSync(partial); } catch {} throw error; }
     fs.renameSync(partial, target); progress(done, total || done);
   }
-  // The newest llama.cpp release that has the Windows Vulkan build.
+  // Official Windows/Linux Vulkan build, including shared libraries for the server.
   async function ensureRuntime(progress = () => {}) {
     const existing = runtimeExe(); if (existing) return existing;
+    if (process.platform !== 'win32' && (process.platform !== 'linux' || process.arch !== 'x64')) throw new Error('이 환경에는 llama-server를 PATH에 설치하거나 LILAC_LLAMA_SERVER로 지정해 주세요.');
     const releases = await (await fetch('https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=8', { headers: { 'User-Agent': 'LilacAnime-Desktop', Accept: 'application/vnd.github+json' } })).json();
-    const asset = (Array.isArray(releases) ? releases : []).flatMap(release => release.assets || []).find(item => RUNTIME_ASSET.test(item.name));
+    const assets = (Array.isArray(releases) ? releases : []).flatMap(release => release.assets || []);
+    const asset = assets.find(item => process.platform === 'win32' ? RUNTIME_ASSET.test(item.name) : /^llama-b\d+-bin-ubuntu-vulkan-x64\.tar\.gz$/.test(item.name));
     if (!asset) throw new Error('llama.cpp 실행 파일을 찾지 못했습니다.');
-    const zip = path.join(root, asset.name);
-    await download(asset.browser_download_url, zip, progress);
-    try { fs.rmSync(runtimeDir, { recursive: true, force: true }); new AdmZip(zip).extractAllTo(runtimeDir, true); } finally { try { fs.unlinkSync(zip); } catch {} }
+    const archive = path.join(root, asset.name);
+    await download(asset.browser_download_url, archive, progress);
+    try {
+      fs.mkdirSync(runtimeDir, { recursive: true });
+      if (process.platform === 'win32') new AdmZip(archive).extractAllTo(runtimeDir, true);
+      else await new Promise((resolve, reject) => {
+        const child = spawn('tar', ['-xzf', archive, '-C', runtimeDir]); let errorText = '';
+        child.stderr.on('data', chunk => errorText += chunk); child.once('error', reject);
+        child.once('close', code => code === 0 ? resolve() : reject(new Error(`llama.cpp 압축 해제 실패: ${errorText.slice(-300)}`)));
+      });
+    } finally { try { fs.unlinkSync(archive); } catch {} }
     const exe = runtimeExe(); if (!exe) throw new Error('llama.cpp 실행 파일을 풀지 못했습니다.'); return exe;
   }
   async function installModel(id, progress = () => {}) {
@@ -97,7 +109,12 @@ function createLocalAi(userData) {
   const pidFile = path.join(root, 'server.pid');
   function stopLeftover() {
     let pid = 0; try { pid = Number(fs.readFileSync(pidFile, 'utf8')) || 0; fs.unlinkSync(pidFile); } catch { return; }
-    if (!pid || process.platform !== 'win32') return;
+    if (!pid) return;
+    if (process.platform === 'linux') {
+      try { if (fs.realpathSync(`/proc/${pid}/exe`) === fs.realpathSync(runtimeExe())) process.kill(pid); } catch { /* already stopped or a different process */ }
+      return;
+    }
+    if (process.platform !== 'win32') return;
     const list = spawn('tasklist', ['/FI', `PID eq ${pid}`, '/NH'], { windowsHide: true }); let out = '';
     list.stdout.on('data', chunk => { out += chunk; });
     return new Promise(resolve => list.once('close', () => { if (/llama-server\.exe/i.test(out)) try { process.kill(pid); } catch {} resolve(); }));
@@ -121,17 +138,20 @@ function createLocalAi(userData) {
       // fail to allocate, the model is loaded again on the CPU alone.
       const launch = async gpuLayers => {
         const port = await freePort();
-        const child = spawn(exe, ['-m', file, '--host', '127.0.0.1', '--port', String(port), '-c', '8192', '-np', String(PARALLEL), ...gpuLayers, '--jinja', '--no-webui'], { cwd: path.dirname(exe), windowsHide: true });
+        const env = { ...process.env };
+        if (process.platform === 'linux') env.LD_LIBRARY_PATH = [path.dirname(exe), path.join(path.dirname(exe), 'lib'), env.LD_LIBRARY_PATH].filter(Boolean).join(':');
+        const child = spawn(exe, ['-m', file, '--host', '127.0.0.1', '--port', String(port), '-c', '8192', '-np', String(PARALLEL), ...gpuLayers, '--jinja', '--no-webui'], { cwd: path.dirname(exe), windowsHide: true, env });
         try { fs.writeFileSync(pidFile, String(child.pid)); } catch {}
         let log = ''; const keep = chunk => { log = (log + chunk.toString()).slice(-8000); };
         child.stdout.on('data', keep); child.stderr.on('data', keep);
-        const exited = new Promise(resolve => child.once('exit', code => resolve(code)));
+        const exited = new Promise(resolve => { child.once('exit', code => resolve({ code })); child.once('error', error => resolve({ error })); });
         const deadline = Date.now() + 180000;
         for (;;) {
-          const code = await Promise.race([exited, new Promise(resolve => setTimeout(() => resolve(undefined), 500))]);
-          if (code !== undefined) {
+          const result = await Promise.race([exited, new Promise(resolve => setTimeout(() => resolve(undefined), 500))]);
+          if (result !== undefined) {
+            if (result.error) throw new Error(`llama.cpp 실행 실패: ${result.error.code || result.error.message}`);
             const memory = /OutOfDeviceMemory|unable to allocate|failed to allocate/i.test(log);
-            const error = new Error(memory ? '그래픽카드 메모리가 부족해 모델을 불러오지 못했습니다. 더 작은 모델(HY-MT1.5 1.8B)을 써 보세요.' : `llama.cpp가 종료되었습니다: ${log.trim().split('\n').filter(line => / E /.test(line)).pop() || log.trim().split('\n').pop() || code}`);
+            const error = new Error(memory ? '그래픽카드 메모리가 부족해 모델을 불러오지 못했습니다. 더 작은 모델(HY-MT1.5 1.8B)을 써 보세요.' : `llama.cpp가 종료되었습니다: ${log.trim().split('\n').filter(line => / E /.test(line)).pop() || log.trim().split('\n').pop() || result.code}`);
             error.memory = memory; throw error;
           }
           try { const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2000) }); if (response.ok) return { child, port }; } catch { /* still loading */ }
@@ -172,7 +192,7 @@ function createLocalAi(userData) {
       if (!response.ok) throw new Error(`llama.cpp HTTP ${response.status}`);
       return (await response.json())?.choices?.[0]?.message?.content;
     };
-    const result = new Map(); let next = 0, done = 0, fatal = null;
+    const result = new Map(); let next = 0, done = 0, fatal = null, lastError = null;
     progress(0, texts.length);
     await Promise.all(Array.from({ length: PARALLEL }, async () => {
       while (next < texts.length && !fatal) {
@@ -182,11 +202,12 @@ function createLocalAi(userData) {
           let text = '';
           for (let attempt = 0; attempt < 3; attempt++) { text = clean(await ask(content), source); if (text && !KANA.test(text)) break; }
           if (text) result.set(index, text);
-        } catch (error) { if (!server) fatal = error; }
+        } catch (error) { lastError = error; if (!server) fatal = error; }
         touch(); progress(++done, texts.length);
       }
     }));
     if (fatal && !result.size) throw fatal;
+    if (!result.size && lastError) throw lastError;
     return { translations: result, model };
   }
 

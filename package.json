@@ -3,6 +3,7 @@
   "version": "0.4.1",
   "description": "LilacAnime inspired desktop anime library and player",
   "main": "electron/main.cjs",
+  "desktopName": "lilacanime-desktop.desktop",
   "author": "LilacAnime Desktop",
   "license": "MIT",
   "scripts": {
@@ -12,7 +13,10 @@
     "predev": "npm run vendor",
     "dev": "electron .",
     "predist": "npm run vendor",
-    "dist": "electron-builder --win nsis",
+    "dist": "electron-builder",
+    "dist:linux": "electron-builder --linux AppImage deb",
+    "dist:win": "electron-builder --win nsis",
+    "test": "node --test tests/preload-cache.test.cjs tests/gemini-key-ring.test.cjs tests/legacy-subtitles.test.cjs tests/jimaku-api.test.cjs && node tests/flix-proxy.test.cjs",
     "prepack": "npm run vendor",
     "pack": "electron-builder --dir"
   },
@@ -43,6 +47,15 @@
       "executableName": "LilacAnime",
       "target": "nsis",
       "artifactName": "LilacAnime-Setup.${ext}"
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "category": "AudioVideo",
+      "maintainer": "Local Linux build <local@localhost>",
+      "syncDesktopName": true,
+      "target": ["AppImage", "deb"],
+      "artifactName": "LilacAnime-${version}-${arch}.${ext}",
+      "desktop": { "entry": { "StartupWMClass": "lilacanime-desktop" } }
     },
     "nsis": {
       "oneClick": false,

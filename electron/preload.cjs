@@ -1,6 +1,10 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('lilac', {
+  platform: process.platform,
+  preparePreload: (url, headers, ratio) => ipcRenderer.invoke('preload:prepare', url, headers, ratio),
+  preloadStatus: id => ipcRenderer.invoke('preload:status', id),
+  closePreload: id => ipcRenderer.invoke('preload:close', id),
   season: () => ipcRenderer.invoke('anime:season'),
   top: () => ipcRenderer.invoke('anime:top'),
   search: query => ipcRenderer.invoke('anime:search', query),
@@ -68,6 +72,7 @@ contextBridge.exposeInMainWorld('lilac', {
   geminiSettings: () => ipcRenderer.invoke('gemini:get'),
   setGeminiSettings: value => ipcRenderer.invoke('gemini:set', value),
   translateSubtitle: options => ipcRenderer.invoke('subtitle:translate', options),
+  confirmLocalTranslation: options => ipcRenderer.invoke('localai:confirm', options),
   jimakuList: (anime, episode) => ipcRenderer.invoke('jimaku:list', anime, episode),
   jimakuDownload: (file, anime, episode) => ipcRenderer.invoke('jimaku:download', file, anime, episode),
   installLocalModel: id => ipcRenderer.invoke('localai:install', id),

@@ -29,6 +29,7 @@ class Updater {
   set(patch) { this.state = { ...this.state, ...patch }; this.broadcast('update:state', this.state); return this.state; }
 
   async check() {
+    if (process.platform !== 'win32') return this.set({ status: 'manual', url: 'https://github.com/whispelyn-byte/LilacAnime-desktop/releases' });
     if (['checking', 'downloading', 'ready'].includes(this.state.status)) return this.state;
     this.set({ status: 'checking', error: null });
     try {
@@ -52,6 +53,7 @@ class Updater {
   }
 
   async download() {
+    if (process.platform !== 'win32') return this.check();
     if (this.state.status === 'ready') return this.state;
     if (this.downloading) return this.downloading;
     if (!this.asset) await this.check();
@@ -93,6 +95,7 @@ class Updater {
   get notesFile() { return path.join(this.app.getPath('userData'), 'update-notes.json'); }
 
   install() {
+    if (process.platform !== 'win32') throw new Error('Linux에서는 새 빌드를 직접 설치해 주세요.');
     if (!this.installer || !fs.existsSync(this.installer)) throw new Error('다운로드된 설치 파일이 없습니다.');
     // The new version shows these notes on its first start, even offline.
     try { fs.writeFileSync(this.notesFile, JSON.stringify({ version: this.state.latest, notes: this.state.notes || '', url: this.state.url || '' })); } catch { /* fetched by tag instead */ }

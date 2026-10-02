@@ -7,6 +7,8 @@ const path = require('path');
 const crypto = require('crypto');
 const { createLocalAi } = require('./local-ai.cjs');
 const { characterTerms } = require('./anime-glossary.cjs');
+const { GeminiKeyRing, normalizeKeys } = require('./gemini-key-ring.cjs');
+const {translateLegacy}=require('./legacy-subtitle-bridge.cjs');
 
 const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta';
 // A whole episode (a few hundred short lines) fits one request, and the free tier allows only a few requests a minute
@@ -16,11 +18,56 @@ const BATCH_LINES = 600, BATCH_CHARS = 30000, PARALLEL = 2, PROMPT_VERSION = 'pr
 function createTranslator(userData) {
   const settingsFile = path.join(userData, 'gemini.json'), cacheDir = path.join(userData, 'subtitles', 'translated');
   const local = createLocalAi(userData);
+  let keyCursor = 0;
+  let saveQueue = Promise.resolve();
+  const envFiles=()=>process.env.LILAC_ENV_FILE?[process.env.LILAC_ENV_FILE]:[
+    path.join(process.cwd(),'.env'),path.resolve(process.cwd(),'../LilacAnime/.env'),path.join(process.cwd(),'LilacAnime','.env'),path.resolve(__dirname,'../../LilacAnime/.env'),
+    ...(process.env.APPIMAGE?[path.resolve(path.dirname(process.env.APPIMAGE),'../../LilacAnime/.env')]:[]),
+    ...(process.versions.electron?[path.resolve(path.dirname(process.execPath),'../../../LilacAnime/.env')]:[])
+  ];
+  const envKeys = () => {
+    const values = [process.env.GEMINI_API_KEY, process.env.GEMINI_API_KEYS];
+    const candidates = envFiles();
+    for (const file of [...new Set(candidates)]) {
+      try {
+        for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+          const match = line.match(/^\s*(?:export\s+)?GEMINI_API_KEY(?:S|_\d+)?\s*=\s*(.*?)\s*$/);
+          if (!match) continue;
+          const raw = match[1];
+          values.push(/^(['"])[\s\S]*\1$/.test(raw) ? raw.slice(1, -1) : raw.replace(/\s+#.*$/, ''));
+        }
+      } catch { /* optional local configuration */ }
+    }
+    return normalizeKeys(values);
+  };
+  const legacyConfig = () => {
+    let model='',fallbackModels;
+    const candidates=envFiles();
+    for(const file of [...new Set(candidates)]){
+      try{for(const line of fs.readFileSync(file,'utf8').split(/\r?\n/)){
+        const match=line.match(/^\s*(?:export\s+)?(GEMINI_MODEL|GEMINI_FALLBACK_MODELS)\s*=\s*(.*?)\s*$/);if(!match)continue;
+        const raw=match[2],value=/^(['"])[\s\S]*\1$/.test(raw)?raw.slice(1,-1):raw.replace(/\s+#.*$/,'');
+        if(match[1]==='GEMINI_MODEL'&&!model)model=value;if(match[1]==='GEMINI_FALLBACK_MODELS'&&fallbackModels===undefined)fallbackModels=value;
+      }}catch{/* optional previous web configuration */}
+    }
+    return {keys:envKeys(),model:process.env.GEMINI_MODEL||model,fallbackModels:process.env.GEMINI_FALLBACK_MODELS??fallbackModels};
+  };
+  const jimakuKey=()=>{
+    if(process.env.JIMAKU_API_KEY)return process.env.JIMAKU_API_KEY.trim();
+    for(const file of [...new Set(envFiles())]){
+      try{for(const line of fs.readFileSync(file,'utf8').split(/\r?\n/)){
+        const match=line.match(/^\s*(?:export\s+)?JIMAKU_API_KEY\s*=\s*(.*?)\s*$/);if(!match)continue;
+        const raw=match[1],value=/^(['"])[\s\S]*\1$/.test(raw)?raw.slice(1,-1):raw.replace(/\s+#.*$/,'');if(value)return value;
+      }}catch{/* optional previous web configuration */}
+    }
+    return '';
+  };
   // The picked model, or the first one on disk when the picked one is not (never downloaded, or deleted).
   const installedModel = id => { const models = local.models(); return models.some(model => model.id === id && model.installed) ? id : models.find(model => model.installed)?.id || id; };
   const read = () => {
     let value = {}; try { value = JSON.parse(fs.readFileSync(settingsFile, 'utf8')) || {}; } catch { /* defaults */ }
-    return { key: String(value.key || '').trim(), model: String(value.model || '').trim(), models: Array.isArray(value.models) ? value.models : [], translateDownloads: Boolean(value.translateDownloadsChosen) && value.translateDownloads === true, translateDownloadsChosen: Boolean(value.translateDownloadsChosen),
+    const keys = 'keys' in value || 'key' in value ? normalizeKeys([value.key, ...(Array.isArray(value.keys) ? value.keys : [value.keys])]) : envKeys();
+    return { key: keys[0] || '', keys, keyWarning: String(value.keyWarning || ''), model: String(value.model || '').trim(), models: Array.isArray(value.models) ? value.models : [], translateDownloads: Boolean(value.translateDownloadsChosen) && value.translateDownloads === true, translateDownloadsChosen: Boolean(value.translateDownloadsChosen),
       localModel: installedModel(String(value.localModel || 'hy-mt-1.8b')),
       // How a picked Jimaku file is translated by itself: 'off', 'gemini' or 'local' (older settings: on = whichever is set up).
       jimakuTranslate: ['off', 'gemini', 'local'].includes(value.jimakuTranslate) ? value.jimakuTranslate : value.autoJimaku === false ? 'off' : 'gemini' };
@@ -30,13 +77,13 @@ function createTranslator(userData) {
   // The player has a button for each provider. Translations nobody asks for (downloads) use Gemini when a key is set,
   // otherwise the local AI when its model is on disk; either way the other one takes over when it stops.
   const ready = provider => { const value = read(); return provider === 'local' ? local.models().some(model => model.id === value.localModel && model.installed) : provider === 'gemini' ? Boolean(value.key) : Boolean(autoProvider()); };
-  const autoProvider = () => ready('gemini') ? 'gemini' : ready('local') ? 'local' : null;
+  const autoProvider = () => ready('gemini') ? 'gemini' : null;
   const write = value => { fs.mkdirSync(path.dirname(settingsFile), { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify(value), 'utf8'); return value; };
 
   async function api(pathname, key, init = {}) {
     const response = await fetch(`${GEMINI_API}${pathname}`, { ...init, signal: AbortSignal.timeout(init.body ? 180000 : 20000), headers: { 'x-goog-api-key': key, ...(init.body ? { 'Content-Type': 'application/json' } : {}) } });
     const root = await response.json().catch(() => ({}));
-    if (!response.ok) { const error = new Error(root?.error?.message || `Gemini HTTP ${response.status}`); error.status = response.status; error.details = root?.error?.details || []; throw error; }
+    if (!response.ok) { const error = new Error(String(root?.error?.message || `Gemini HTTP ${response.status}`).split(key).join('[API 키]')); error.status = response.status; error.details = root?.error?.details || []; throw error; }
     return root;
   }
   // Text models that can generate content, newest first; image, audio, live and embedding models are left out.
@@ -56,20 +103,39 @@ function createTranslator(userData) {
   }
 
   // Only the fields given change; a new key is checked by listing its models.
-  async function saveSettings(change = {}) {
+  function saveSettings(change = {}) {
+    const pending = saveQueue.then(() => updateSettings(change));
+    saveQueue = pending.catch(() => {});
+    return pending;
+  }
+  async function updateSettings(change = {}) {
     const current = read(), next = { ...current };
     // Off unless turned on in 설정 (older settings saved it on without anyone choosing, so they start off once).
     if ('translateDownloads' in change) Object.assign(next, { translateDownloads: change.translateDownloads === true, translateDownloadsChosen: true });
     if ('jimakuTranslate' in change && ['off', 'gemini', 'local'].includes(change.jimakuTranslate)) next.jimakuTranslate = change.jimakuTranslate;
     if ('localModel' in change) next.localModel = String(change.localModel || current.localModel);
-    if ('model' in change && next.models.includes(change.model)) next.model = change.model;
-    if ('key' in change && String(change.key || '').trim() !== current.key) {
-      next.key = String(change.key || '').trim();
-      if (!next.key) Object.assign(next, { model: '', models: [] });
-      else {
-        const models = await listModels(next.key);
-        if (!models.length) throw new Error('이 키로 쓸 수 있는 Gemini 모델이 없습니다.');
-        Object.assign(next, { models, model: models.includes(change.model) ? change.model : defaultModel(models) });
+    let requestedModel;
+    if ('model' in change) {
+      requestedModel = String(change.model || '').trim().replace(/^models\//, '');
+      if (requestedModel && !/^gemini-[\w.-]+$/.test(requestedModel)) throw new Error('Gemini 모델 ID를 확인해 주세요. 예: gemini-2.5-flash');
+      next.model = requestedModel;
+    }
+    if ('keys' in change || 'key' in change || change.refreshModels) {
+      const keys = normalizeKeys('keys' in change ? change.keys : 'key' in change ? change.key : current.keys);
+      if (change.refreshModels || JSON.stringify(keys) !== JSON.stringify(current.keys) || current.keyWarning || (!current.models.length && keys.length)) {
+        next.keys = keys; next.key = keys[0] || ''; next.keyWarning = '';
+        if (!next.key) Object.assign(next, { model: '', models: [] });
+        else {
+          const pool = new GeminiKeyRing(keys);
+          try {
+            const models = await pool.call(listModels);
+            if (!models.length) throw new Error('이 키로 쓸 수 있는 Gemini 모델이 없습니다.');
+            Object.assign(next, { models, model: requestedModel !== undefined ? requestedModel : models.includes(current.model) ? current.model : defaultModel(models) });
+          } catch (error) {
+            if (error.status !== 429 && !(error.status >= 500) && !['TimeoutError', 'TypeError'].includes(error.name)) throw error;
+            next.keyWarning = '키는 저장했습니다. 모델 목록 확인이 일시적으로 제한되어 기존 모델로 시도합니다.';
+          }
+        }
       }
     }
     write(next); return settings();
@@ -78,7 +144,7 @@ function createTranslator(userData) {
   // Gemini 2.5 takes a thinking budget, later models a thinking level; subtitles need little of either.
   // Each simpler configuration is tried when a model rejects the previous one.
   const workingConfig = new Map();
-  async function generate(key, model, system, text) {
+  async function generate(keyRing, model, system, text) {
     const schema = { type: 'ARRAY', items: { type: 'OBJECT', properties: { i: { type: 'INTEGER' }, t: { type: 'STRING' } }, required: ['i', 't'] } };
     const thinking = /^gemini-2\.5/.test(model) ? { thinkingBudget: /pro/.test(model) ? 128 : 0 } : { thinkingLevel: 'low' };
     const configs = [{ responseMimeType: 'application/json', responseSchema: schema, temperature: 0.3, thinkingConfig: thinking }, { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.3 }, { responseMimeType: 'application/json' }];
@@ -87,7 +153,10 @@ function createTranslator(userData) {
       const generationConfig = configs[index];
       for (let attempt = 0; attempt < 4; attempt++) {
         try {
-          const root = await api(`/models/${encodeURIComponent(model)}:generateContent`, key, { method: 'POST', body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text }] }], generationConfig }) });
+          const root = await keyRing.call(key => api(`/models/${encodeURIComponent(model)}:generateContent`, key, {
+            method: 'POST',
+            body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents: [{ role: 'user', parts: [{ text }] }], generationConfig })
+          }));
           const output = (root.candidates?.[0]?.content?.parts || []).filter(part => !part.thought).map(part => part.text || '').join('');
           if (output) { workingConfig.set(model, index); return output; }
           last = new Error(`Gemini가 빈 응답을 보냈습니다 (${root.candidates?.[0]?.finishReason || root.promptFeedback?.blockReason || 'unknown'}).`); break;
@@ -171,7 +240,7 @@ function createTranslator(userData) {
 
   // Gemini, batch by batch, into translated (by line id). Stops at an error every batch would hit (a bad key, the
   // day's allowance used up) and throws it, keeping what was translated before.
-  async function translateGemini(settings, model, lines, translated, context, progress) {
+  async function translateGemini(keyRing, model, lines, translated, context, progress) {
     const groups = batches(lines);
     let done = 0, next = 0, fatal = null;
     progress(0, groups.length);
@@ -181,7 +250,7 @@ function createTranslator(userData) {
         const input = JSON.stringify(group.map(line => ({ i: line.i, t: line.text }))), ids = new Set(group.map(line => line.i));
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
-            const answer = JSON.parse((await generate(settings.key, model, system(context), input)).replace(/^```(?:json)?\s*|\s*```$/g, ''));
+            const answer = JSON.parse((await generate(keyRing, model, system(context), input)).replace(/^```(?:json)?\s*|\s*```$/g, ''));
             // Only this batch's lines: a stray id must not overwrite another batch's translation.
             for (const item of Array.isArray(answer) ? answer : []) if (ids.has(item?.i) && typeof item.t === 'string' && item.t.trim()) translated.set(item.i, item.t.trim());
             if (group.every(line => translated.has(line.i)) || attempt) break;
@@ -198,13 +267,16 @@ function createTranslator(userData) {
     if (!lines.some(line => translated.has(line.i))) throw new Error('Gemini 번역 결과를 받지 못했습니다.');
   }
 
-  // provider: the one asked for, otherwise Gemini when its key is set, else the local AI. When it is not set up or
-  // stops (no key, the day's free allowance used up, no model, llama.cpp not starting) the other one takes over if it
-  // is set up, and translates the lines still left. progress(done, total) is called after each batch (local: each
-  // line); status(text) while the local model starts or the other one takes over.
-  async function translate({ file, title = '', provider = '', context = {}, progress = () => {}, status = () => {} }) {
+  // One explicitly requested provider per invocation. The player obtains consent before a local retry.
+  async function translate({ file, title = '', provider = '', context = {}, japaneseFile = '', episode = 1, legacy = false, progress = () => {}, status = () => {} }) {
     const settings = read(), wanted = provider || autoProvider() || 'gemini';
-    const order = [wanted, wanted === 'local' ? 'gemini' : 'local'].filter(name => ready(name));
+    if(legacy&&wanted==='gemini'){
+      const prior=legacyConfig(),available=prior.keys.length?prior.keys:settings.keys;
+      const start=available.length?keyCursor++%available.length:0,keys=[...available.slice(start),...available.slice(0,start)];
+      return translateLegacy({file,japaneseFile,title,episode,model:prior.model||settings.model||'gemini-2.5-flash',keys,cacheDir,status,fallbackModels:prior.fallbackModels});
+    }
+    // Provider changes require the player's explicit confirmation, never automatic fallback.
+    const order = [wanted].filter(name => ready(name));
     if (!order.length) throw new Error(wanted === 'local' ? '설정 > 자막 자동 번역에서 로컬 AI 모델을 먼저 받아 주세요.' : '설정 > 자막 자동 번역에서 Gemini API 키를 넣어 주세요.');
     const localModel = local.models().find(item => item.id === settings.localModel);
     const modelOf = name => name === 'local' ? `local:${localModel.file || localModel.label}` : settings.model || defaultModel(settings.models) || 'gemini-flash-latest';
@@ -213,34 +285,18 @@ function createTranslator(userData) {
     const hashOf = name => crypto.createHash('sha1').update(`${modelOf(name)}\n${name === 'local' ? LOCAL_PROMPT_VERSION : PROMPT_VERSION}\n${source}`).digest('hex').slice(0, 20);
     const out = path.join(cacheDir, `${hashOf(order[0])}.vtt`);
     if (fs.existsSync(out)) { progress(1, 1); return { path: out, model: modelOf(order[0]), failed: 0, cached: true }; }
+    const keyRing = new GeminiKeyRing(settings.keys, { start: order.includes('gemini') ? keyCursor++ : 0, status });
 
     const cues = parseVtt(source);
     if (!cues.length) throw new Error('번역할 자막 줄이 없습니다.');
     // Identical lines (repeated cues, karaoke layers) are translated once.
     const unique = [...new Set(cues.map(cue => plain(cue.text)).filter(text => /\p{L}/u.test(text)))].map((text, i) => ({ i, text }));
-    const translated = new Map(), used = [];
-    let lastError = null, fallbackReason = '';
-    for (const [index, name] of order.entries()) {
-      const lines = unique.filter(line => !translated.has(line.i));
-      if (!lines.length) break;
-      if (index) { fallbackReason = lastError?.message || ''; status(name === 'local' ? 'Gemini를 쓸 수 없어 로컬 AI로 번역하는 중' : '로컬 AI를 쓸 수 없어 Gemini로 번역하는 중'); }
-      const before = translated.size;
-      try {
-        if (name === 'local') {
-          const { translations } = await local.translateLines(lines.map(line => line.text), { modelId: localModel.id, progress, status, context });
-          lines.forEach((line, index) => { if (translations.has(index)) translated.set(line.i, translations.get(index)); });
-        } else await translateGemini(settings, modelOf(name), lines, translated, { title, ...context }, progress);
-        lastError = null;
-      } catch (error) { lastError = error; }
-      if (translated.size > before) used.push(name);
-      if (!lastError) break;
-    }
-    if (!translated.size) throw lastError || new Error('번역 결과를 받지 못했습니다.');
-    const last = used[used.length - 1];
-    // A translation made by one is cached under its name; one put together from both is kept only for this time.
-    const result = writeResult(cues, unique, translated, hashOf(last), modelOf(last), used.length === 1);
-    if (used.every(name => name === wanted)) return result;
-    return { ...result, fallbackFrom: wanted, fallbackReason: fallbackReason || (wanted === 'local' ? '로컬 AI 모델이 없습니다.' : 'Gemini API 키가 없습니다.') };
+    const translated = new Map();
+    if(wanted==='local'){
+      const {translations}=await local.translateLines(unique.map(line=>line.text),{modelId:localModel.id,progress,status,context});
+      unique.forEach((line,index)=>{if(translations.has(index))translated.set(line.i,translations.get(index));});
+    }else await translateGemini(keyRing,modelOf(wanted),unique,translated,{title,...context},progress);
+    return writeResult(cues,unique,translated,hashOf(wanted),modelOf(wanted));
   }
   function writeResult(cues, unique, translated, hash, model, cache = true) {
     if (!translated.size) throw new Error('번역 결과를 받지 못했습니다.');
@@ -258,7 +314,7 @@ function createTranslator(userData) {
     return { path: target, model, failed, cached: false };
   }
 
-  return { settings, saveSettings, translate, ready, local };
+  return { settings, saveSettings, translate, ready, jimakuKey, legacyReady:()=>Boolean(legacyConfig().keys.length||read().keys.length), local };
 }
 
 module.exports = { createTranslator };

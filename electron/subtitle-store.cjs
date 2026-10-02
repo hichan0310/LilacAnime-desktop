@@ -4,7 +4,9 @@ const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 
-const SOURCES = ['linkkf', 'reanime', 'kairan', 'csora', 'anissia', 'jimaku', 'user', 'provider', 'download', 'gemini'];
+const SOURCES = ['linkkf', 'reanime', 'kairan', 'csora', 'anissia', 'jimaku', 'user', 'provider', 'download', 'gemini', 'local'];
+// Older builds mislabeled local translations as source=gemini. Recognize their original labels too.
+const isLocalTranslation=entry=>entry?.source==='local'||String(entry?.model||'').startsWith('local:')||/로컬\s*(?:AI|인공지능)|local\s*AI/i.test(`${entry?.label||''} ${entry?.subtitleLabel||''}`);
 
 class SubtitleStore {
   constructor({ app }) {
@@ -19,17 +21,18 @@ class SubtitleStore {
     return { ...entry, url: pathToFileURL(entry.path).href, assUrl: entry.assPath && fs.existsSync(entry.assPath) ? pathToFileURL(entry.assPath).href : null };
   }
 
-  list(key) {
+  list(key, {includeLocal=false}={}) {
     const entries = (this.data[key] || []).filter(entry => entry.path && fs.existsSync(entry.path));
     if (entries.length !== (this.data[key] || []).length) { this.data[key] = entries; this.write(); }
-    return entries.map(entry => this.withUrls(entry));
+    // Keep files/records intact, but never automatically offer a local result from a previous session.
+    return entries.filter(entry=>includeLocal||!isLocalTranslation(entry)).map(entry => this.withUrls(entry));
   }
 
   save(key, entry = {}) {
     if (!key || !entry.path || !fs.existsSync(entry.path)) return null;
     const source = SOURCES.includes(entry.source) ? entry.source : 'user';
     const list = (this.data[key] || []).filter(item => !(item.source === source && item.path === entry.path));
-    const saved = { id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, source, label: String(entry.label || source), path: entry.path, assPath: entry.assPath || null, fonts: Array.isArray(entry.fonts) ? entry.fonts : [], saved: Date.now() };
+    const saved = { id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, source, label: String(entry.label || source), model:String(entry.model||''), path: entry.path, assPath: entry.assPath || null, fonts: Array.isArray(entry.fonts) ? entry.fonts : [], saved: Date.now() };
     this.data[key] = [saved, ...list].slice(0, 20);
     this.write();
     return this.withUrls(saved);
@@ -50,4 +53,4 @@ class SubtitleStore {
   }
 }
 
-module.exports = { SubtitleStore };
+module.exports = { SubtitleStore, isLocalTranslation };

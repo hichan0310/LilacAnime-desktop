@@ -12,10 +12,15 @@ const { createFlixProxyUrl, createFlixAvProxyUrl, closeFlixProxy } = require('./
 const { detectOpEd } = require('./oped-fingerprint.cjs');
 const { DownloadManager } = require('./download-manager.cjs');
 const { Updater } = require('./updater.cjs');
-const { SubtitleStore } = require('./subtitle-store.cjs');
+const { SubtitleStore, isLocalTranslation } = require('./subtitle-store.cjs');
 const { createTranslator } = require('./subtitle-translator.cjs');
+const {stopLegacyTranslations}=require('./legacy-subtitle-bridge.cjs');
+const {createJimakuApi}=require('./jimaku-api.cjs');
+const { PreloadCache } = require('./preload-cache.cjs');
+let preloadCache;
 let subtitleTranslator = null;
 const translator = () => subtitleTranslator ||= createTranslator(app.getPath('userData'));
+const jimakuApi=createJimakuApi({apiKey:()=>translator().jimakuKey()});
 
 app.commandLine.appendSwitch('disable-blink-features','AutomationControlled');
 // Android BackgroundAudioService: playback continues while the window is hidden or minimized.
@@ -1343,6 +1348,7 @@ async function jimakuAnilistId(anime={}){
 // The episode's files, best first (ASS over SRT, furigana / .ja ASS a little ahead, the season's own files ahead). A
 // movie's entry has no numbered files, so all of them are listed.
 async function jimakuEpisodeFiles(anime,episode){
+  if(translator().jimakuKey())return jimakuApi.files(anime,episode);
   const anilistId=await jimakuAnilistId(anime);if(!anilistId)throw new Error('AniList 작품을 찾지 못해 Jimaku를 검색할 수 없습니다.');
   const entry=await jimakuEntryId(anilistId);if(!entry)throw new Error('Jimaku에 이 작품의 자막이 없습니다.');
   const files=await jimakuFiles(entry),season=titleSeason(anime.title||'');
@@ -1359,7 +1365,11 @@ function japaneseSubtitleText(buffer){
 }
 async function jimakuDownload(file,anime,episode){
   if(!/^https:\/\/jimaku\.cc\/entry\/\d+\/download\//.test(String(file?.url||'')))throw new Error('Jimaku 파일 주소가 아닙니다.');
-  const text=japaneseSubtitleText(await downloadBuffer(file.url,`${JIMAKU_WEB}/entry/${file.entry}`)).replace(/^\uFEFF/,'');
+  const bytes=translator().jimakuKey()?await jimakuApi.download(file):await downloadBuffer(file.url,`${JIMAKU_WEB}/entry/${file.entry}`);
+  return jimakuSave(file,bytes,anime,episode);
+}
+function jimakuSave(file,bytes,anime,episode){
+  const text=japaneseSubtitleText(bytes).replace(/^\uFEFF/,'');
   const ext=communitySubtitleExt(Buffer.from(text.slice(0,8192),'utf8'))||path.extname(file.name).toLowerCase();
   const dir=path.join(app.getPath('userData'),'subtitles','jimaku',String(Number(file.anilistId)||simpleTitle(anime?.title||'').replace(/\s+/g,'_')||'anime'),String(Number(episode)||1));fs.mkdirSync(dir,{recursive:true});
   const out=path.join(dir,`${communityFileName(file.name).replace(/\.[^.]+$/,'')}${ext}`);fs.writeFileSync(out,text,'utf8');
@@ -1537,14 +1547,14 @@ async function downloadHls(url,filePath,event){
 
 function createWindow() {
   const win = new BrowserWindow({
+    show: process.env.LILAC_SMOKE_LINUX !== '1',
     width: 1440,
     height: 900,
     minWidth: 980,
     minHeight: 680,
     icon: path.join(__dirname, '..', 'build', 'icon.png'),
     backgroundColor: '#121212',
-    titleBarStyle: 'hidden',
-    titleBarOverlay: { color: '#121212', symbolColor: '#d0cdd6', height: 42 },
+    ...(process.platform === 'linux' ? {} : { titleBarStyle: 'hidden', titleBarOverlay: { color: '#121212', symbolColor: '#d0cdd6', height: 42 } }),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -1561,6 +1571,7 @@ function createWindow() {
 app.whenReady().then(async () => {
   const broadcast=(channel,value)=>BrowserWindow.getAllWindows().forEach(win=>{if(!win.isDestroyed())win.webContents.send(channel,value)});
   const subtitleStore=new SubtitleStore({app});
+  const localTranslationGrants=new Map();
   // Same order as the player's ensureSubtitle: the preferred source's saved file, the stream's own
   // subtitle, any saved file, then Kairan/Csora.
   const downloadSubtitleKey=job=>{const episode=job.episode||{};return encodeURIComponent(String(episode.url||episode.token||episode.id||episode.number||''))};
@@ -1585,7 +1596,7 @@ app.whenReady().then(async () => {
   };
   // Unless the stream has its own Korean track: the episode's best Jimaku file (saved for the episode too, so the
   // player offers it), translated when 설정 > Jimaku 자막 자동 번역 is Gemini or the local AI and one of them is set up.
-  const jimakuTranslation=()=>{const setting=translator().settings().jimakuTranslate;return setting!=='off'&&translator().ready()?setting:null};
+  const jimakuTranslation=()=>translator().settings().jimakuTranslate!=='off'&&translator().ready('gemini')?'gemini':null;
   const findDownloadJimaku=async job=>{
     const anime=job.anime||{},episode=Number(job.episodeNumber)||1,[file]=await jimakuEpisodeFiles(anime,episode).catch(()=>[]);if(!file)return null;
     const result=await jimakuDownload(file,anime,episode),key=downloadSubtitleKey(job);
@@ -1785,7 +1796,12 @@ app.whenReady().then(async () => {
   ipcMain.handle('subtitle-store:list',(_,key)=>subtitleStore.list(String(key||'')));
   ipcMain.handle('subtitle-store:save',(_,key,entry)=>subtitleStore.save(String(key||''),entry));
   ipcMain.handle('subtitle-store:remove',(_,key,id)=>subtitleStore.remove(String(key||''),String(id||'')));
-  ipcMain.handle('window:theme',(event,light)=>{const win=BrowserWindow.fromWebContents(event.sender);if(win&&!win.isDestroyed())win.setTitleBarOverlay(light?{color:'#ffffff',symbolColor:'#1c1b1f',height:42}:{color:'#121212',symbolColor:'#d0cdd6',height:42});});
+  ipcMain.handle('window:theme',(event,light)=>{const win=BrowserWindow.fromWebContents(event.sender);if(process.platform!=='linux'&&win&&!win.isDestroyed())win.setTitleBarOverlay(light?{color:'#ffffff',symbolColor:'#1c1b1f',height:42}:{color:'#121212',symbolColor:'#d0cdd6',height:42});});
+  const cacheRoot = process.platform === 'linux' ? process.env.XDG_CACHE_HOME || path.join(app.getPath('home'), '.cache') : app.getPath('temp');
+  preloadCache = new PreloadCache(path.join(cacheRoot, 'LilacAnime-preload'));
+  ipcMain.handle('preload:prepare', (_, url, headers, ratio) => preloadCache.prepare(url, headers, ratio));
+  ipcMain.handle('preload:status', (_, id) => preloadCache.status(id));
+  ipcMain.handle('preload:close', (_, id) => preloadCache.release(id));
   ipcMain.handle('update:state',()=>updater.state);
   ipcMain.handle('update:notes',()=>updater.notes());
   ipcMain.handle('update:check',()=>updater.check());
@@ -1796,7 +1812,11 @@ app.whenReady().then(async () => {
   ipcMain.handle('downloads:cancel',(_,id)=>downloadManager.cancel(id));
   ipcMain.handle('downloads:resume',(_,id)=>downloadManager.resume(id));
   ipcMain.handle('downloads:remove',(_,id)=>downloadManager.remove(id));
-  ipcMain.handle('downloads:play',(_,id)=>downloadManager.localPlayback(id));
+  ipcMain.handle('downloads:play',(_,id)=>{
+    const stream=downloadManager.localPlayback(id);
+    // A downloaded video may carry an old, unauthorized local primary subtitle.
+    return isLocalTranslation(stream)?{...stream,subtitleUrl:null,subtitleAss:null,subtitleLabel:''}:stream;
+  });
   ipcMain.handle('downloads:open-folder',()=>shell.openPath(downloadManager.root));
   // Android OpEdSkipResolver: online playback uses AniSkip only; a downloaded episode uses the AniSkip
   // timestamps saved with the download, then the local audio analyzer over other downloaded episodes.
@@ -1886,13 +1906,45 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('localai:remove',(_,id)=>{translator().local.removeModel(String(id||''));return translator().settings()});
   ipcMain.handle('gemini:set',(_,value={})=>translator().saveSettings(value||{}));
-  ipcMain.handle('subtitle:translate',async(event,{path:file='',title='',id=0,provider='',anime=null}={})=>{
+  ipcMain.handle('localai:confirm',async(event,{reason='',english=false,path:file='',id=0}={})=>{
+    const window=BrowserWindow.fromWebContents(event.sender);
+    const options={type:'question',title:'로컬 AI 번역',message:'로컬 AI로 돌리겠습니까?',detail:`Gemini 번역을 완료하지 못했습니다.\n${String(reason).slice(0,1200)}\n\n동의하면 ${english?'이 회차의 영어 자막':'선택된 원문 자막'}을 로컬 모델로 번역합니다.`,buttons:['취소','로컬 AI로 번역'],defaultId:0,cancelId:0,noLink:true};
+    const result=window?await dialog.showMessageBox(window,options):await dialog.showMessageBox(options);
+    localTranslationGrants.delete(event.sender.id);
+    if(result.response===1)localTranslationGrants.set(event.sender.id,{file:path.resolve(String(file||'')),id});
+    return result.response===1;
+  });
+  ipcMain.handle('subtitle:translate',async(event,{path:file='',title='',id=0,provider='',anime=null,episode=1,english=false,legacy=false}={})=>{
     const resolved=path.resolve(String(file||''));
     // App subtitle files and the tracks saved with downloads.
     if(![path.join(app.getPath('userData'),'subtitles'),downloadManager?.root].some(root=>root&&resolved.startsWith(root+path.sep))||!/\.vtt$/i.test(resolved)||!fs.existsSync(resolved))throw new Error('번역할 자막 파일이 없습니다.');
+    if(provider==='local'){
+      const grant=localTranslationGrants.get(event.sender.id);
+      if(!grant||grant.file!==resolved||grant.id!==id)throw new Error('이번 자막의 로컬 AI 사용에 동의하지 않았습니다.');
+      localTranslationGrants.delete(event.sender.id);
+    }
     const send=value=>{if(!event.sender.isDestroyed())event.sender.send('translate:progress',{id,...value})};
-    const context=await translationContext(anime||{},String(title||''));
-    const result=await translator().translate({file:resolved,title:String(title||''),provider:['gemini','local'].includes(provider)?provider:'',context,progress:(done,total)=>send({done,total}),status:text=>send({status:text})});
+    let japaneseFile='';
+    if(english&&provider!=='local'&&(legacy?translator().legacyReady():translator().ready('gemini'))){
+      send({status:'Jimaku에서 이번 회차의 일본어 원문을 찾고 있어요'});
+      try{
+        if(legacy){
+          const selected=await jimakuApi.find({...anime,title:anime?.title||String(title)},episode,fs.readFileSync(resolved));
+          const result=jimakuSave(selected,selected.bytes,anime,episode);
+          japaneseFile=result.assPath||result.path;
+          send({status:`일본어 원문 선택 완료 · ${selected.compared}개 후보 비교 · ${selected.name}`});
+        }else{
+        const files=await jimakuEpisodeFiles({...anime,title:anime?.title||String(title)},episode);
+        // A ranged pack is not necessarily this episode's script. Only direct subtitle files are considered.
+        for(const candidate of files.filter(file=>file.score>=50||files.length===1).slice(0,3)){
+          try{const result=await jimakuDownload(candidate,anime,episode);const text=fs.readFileSync(result.path,'utf8');if(/[\u3040-\u30ff]/.test(text)){japaneseFile=result.path;break;}}catch{/* try the next ranked release */}
+        }
+        }
+      }catch(error){if(legacy)throw new Error(`일본어 원문 준비 실패: ${error.message}`);}
+      send({status:japaneseFile?'일본어 원문 준비 완료 · 전체 회차 번역을 준비하고 있어요':legacy?'이번 회차의 Jimaku 일본어 원문을 찾지 못했습니다':'Jimaku 원문을 찾지 못해 영어 자막으로 번역을 준비하고 있어요'});
+    }else send({status:'작품 정보와 번역 캐시를 확인하고 있어요'});
+    const context=legacy&&provider!=='local'?{}:await translationContext(anime||{},String(title||''));
+    const result=await translator().translate({file:resolved,title:String(title||''),provider:['gemini','local'].includes(provider)?provider:'',context,japaneseFile,episode,legacy,progress:(done,total)=>send({done,total}),status:text=>send({status:text})});
     return subtitleResult(result.path,{model:result.model,failed:result.failed,cached:result.cached,fallbackFrom:result.fallbackFrom||'',fallbackReason:result.fallbackReason||''});
   });
   // Several lookups at a time (TMDB answers quickly; AniList allows about 90 requests a minute).
@@ -1916,10 +1968,18 @@ app.whenReady().then(async () => {
     if(key)buildCatalogIndexes().catch(()=>{});
     return {key};
   });
-  ipcMain.handle('font:default', (_, choice = '기본체', customPath = '') => {
+  ipcMain.handle('font:default', async (_, choice = '기본체', customPath = '') => {
     const windir = process.env.WINDIR || 'C:\\Windows', system = name => path.join(windir, 'Fonts', name), user = name => path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Windows', 'Fonts', name);
     const presets = { '기본체': [system('malgun.ttf')], '나눔고딕': [system('NanumGothic.ttf'), user('NanumGothic.ttf')], '명조체': [system('batang.ttc'), system('NanumMyeongjo.ttf'), user('NanumMyeongjo.ttf')] };
     const candidates = [customPath, ...(presets[choice] || []), system('malgun.ttf'), system('gulim.ttc')].filter(Boolean);
+    if (process.platform === 'linux') {
+      const family = choice === '명조체' ? 'Noto Serif CJK KR' : choice === '나눔고딕' ? 'NanumGothic' : 'Noto Sans CJK KR';
+      const matched = await new Promise(resolve => {
+        const child = spawn('fc-match', ['-f', '%{file}', `${family}:lang=ko`]); let output = '';
+        child.stdout.on('data', chunk => output += chunk); child.on('error', () => resolve('')); child.on('close', code => resolve(code === 0 ? output.trim() : ''));
+      });
+      if (matched) candidates.splice(customPath ? 1 : 0, 0, matched);
+    }
     // libass picks its fallback font by family name, so the real family name is read from the font file.
     for (const file of candidates) {
       if (!/\.(ttf|otf|ttc)$/i.test(file) || !fs.existsSync(file)) continue;
@@ -1948,6 +2008,26 @@ app.whenReady().then(async () => {
     }catch(error){console.error(`LILAC_SMOKE_FAILED ${error.stack||error.message}`);process.exitCode=1}
     app.quit();return;
   }
+  if (process.env.LILAC_SMOKE_LINUX === '1') {
+    const errors = [];
+    const originalCreate = createWindow;
+    originalCreate();
+    mainWindow.webContents.on('console-message', (_event, level, message) => { if (level === 3) errors.push(message); });
+    mainWindow.webContents.on('did-fail-load', (_event, code, message) => { console.error(`LINUX_SMOKE_LOAD_FAILED ${code}: ${message}`); app.exit(1); });
+    mainWindow.webContents.once('did-finish-load', async () => {
+      try {
+        const result = await mainWindow.webContents.executeJavaScript(`({platform:window.lilac.platform,slider:document.getElementById('preloadRatio')?.value,sliderPane:document.getElementById('preloadRatio')?.closest('[data-ps-pane]')?.dataset.psPane,manualSubtitleUI:!!document.querySelector('#psSubtitleSources,#subtitleTracks,#savedSubtitles,#findSubtitle,#openSubtitle,#subtitleSource'),localConsent:typeof window.lilac.confirmLocalTranslation,hls:typeof Hls,api:typeof window.lilac.preparePreload,player:typeof play,settings:!!document.getElementById('settingsView')})`);
+        if (result.platform !== 'linux' || result.api !== 'function' || result.player !== 'function' || !result.settings || !Number.isFinite(Number(result.slider)) || Number(result.slider)<0 || Number(result.slider)>1) throw new Error(JSON.stringify(result));
+        if(result.manualSubtitleUI||result.sliderPane!=='subtitle'||result.localConsent!=='function')throw new Error(JSON.stringify(result));
+        await mainWindow.webContents.executeJavaScript(`window.lilac.setWindowTheme(false)`);
+        console.log(`LINUX_SMOKE_OK ${JSON.stringify({ ...result, errors })}`);
+        if (errors.some(message => /ReferenceError|SyntaxError|TypeError/.test(message))) process.exitCode = 1;
+      } catch (error) { console.error(`LINUX_SMOKE_FAILED ${error.stack || error}`); process.exitCode = 1; }
+      finally { app.quit(); }
+    });
+    setTimeout(() => { console.error('LINUX_SMOKE_TIMEOUT'); app.exit(1); }, 20000).unref();
+    return;
+  }
   createWindow();
   // Installed builds check GitHub releases shortly after launch; dev runs use the settings button.
   // At start and every 3 hours while the app stays open.
@@ -1957,5 +2037,5 @@ app.whenReady().then(async () => {
   app.on('activate', () => { if (!mainWindow || mainWindow.isDestroyed()) createWindow(); });
 });
 
-app.on('before-quit', () => { closeFlixProxy(); subtitleTranslator?.local?.stop(); });
+app.on('before-quit', () => { stopLegacyTranslations(); preloadCache?.close(); closeFlixProxy(); subtitleTranslator?.local?.stop(); });
 app.on('window-all-closed', () => { if (process.env.LILAC_SMOKE_REANIME==='1')return;if (process.platform !== 'darwin') app.quit(); });

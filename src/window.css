@@ -2,6 +2,9 @@
 .topbar {
   padding-right: 158px;
 }
+/* Linux uses the desktop's native title bar and window controls. */
+body[data-platform="linux"] .topbar { padding-right: 24px; }
+body[data-platform="linux"] .window-drag { display: none; }
 
 @media (max-width: 760px) {
   .topbar {
